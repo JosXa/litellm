@@ -39,6 +39,18 @@ def test_routes_on_litellm_proxy():
 
     this prevents accidentelly deleting /threads, or /batches etc
     """
+    # Optional feature routers register on first request via LazyFeatureMiddleware.
+    # Force-load them here so this test sees the full route set.
+    import importlib
+
+    from litellm.proxy._lazy_features import LAZY_FEATURES
+
+    for feat in LAZY_FEATURES:
+        if feat.module_path in sys.modules:
+            continue
+        module = importlib.import_module(feat.module_path)
+        feat.register_fn(app, module)
+
     _all_routes = []
     for route in app.routes:
 
