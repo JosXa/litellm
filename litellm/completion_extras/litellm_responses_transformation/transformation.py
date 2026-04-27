@@ -1154,7 +1154,7 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
 
                 function_chunk = ChatCompletionToolCallFunctionChunk(
                     name=output_item.get("name", None),
-                    arguments=parsed_chunk.get("arguments", ""),
+                    arguments=output_item.get("arguments", ""),
                 )
 
                 if provider_specific_fields:
@@ -1183,8 +1183,13 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
                         )
                     ]
                 )
-        elif event_type == "response.function_call_arguments.delta":
+        elif event_type in (
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        ):
             content_part: Optional[str] = parsed_chunk.get("delta", None)
+            if content_part is None:
+                content_part = parsed_chunk.get("arguments", None)
             if content_part:
                 tool_call_index = parsed_chunk.get("output_index", 0)
                 return ModelResponseStream(
