@@ -1661,6 +1661,50 @@ def test_multi_tool_call_stream_no_premature_finish():
     print("✓ Multi-tool-call stream completes without premature finish_reason termination")
 
 
+def test_function_call_arguments_done_emits_tool_call_argument_chunk():
+    """Regression test for ChatGPT/Codex streams that emit only arguments.done."""
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        OpenAiResponsesToChatCompletionStreamIterator,
+    )
+
+    added_chunk = {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "type": "function_call",
+            "call_id": "call_pwd",
+            "name": "bash",
+            "arguments": "",
+        },
+    }
+    done_chunk = {
+        "type": "response.function_call_arguments.done",
+        "output_index": 0,
+        "arguments": '{"command":"pwd","description":"Print current working directory"}',
+    }
+
+    added_result = OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(
+        added_chunk
+    )
+    done_result = OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(
+        done_chunk
+    )
+
+    added_tool_call = added_result.choices[0].delta.tool_calls[0]
+    assert added_tool_call.id == "call_pwd"
+    assert added_tool_call.function.name == "bash"
+    assert added_tool_call.function.arguments == ""
+
+    done_tool_call = done_result.choices[0].delta.tool_calls[0]
+    assert done_tool_call.id is None
+    assert done_tool_call.index == 0
+    assert done_tool_call.function.name is None
+    assert (
+        done_tool_call.function.arguments
+        == '{"command":"pwd","description":"Print current working directory"}'
+    )
+
+
 # =============================================================================
 # Tests for issue #21331: Parallel tool call indices in streaming
 # =============================================================================

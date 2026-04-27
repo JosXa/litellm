@@ -958,7 +958,7 @@ def responses_api_bridge_check(
         # OpenAI gpt-5.4+ chat-completions calls with both tools + reasoning_effort
         # must be bridged to Responses API.
         if (
-            custom_llm_provider == "openai"
+            custom_llm_provider in ("openai", "chatgpt")
             and OpenAIGPT5Config.is_model_gpt_5_4_plus_model(model)
             and tools
             and reasoning_effort is not None
