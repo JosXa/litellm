@@ -180,6 +180,7 @@ from litellm.utils import (
     EmbeddingResponse,
     ModelResponse,
     Rules,
+    _get_retry_after_from_exception_header,
     function_setup,
     get_llm_provider,
     get_non_default_completion_params,
@@ -5939,6 +5940,25 @@ class Router:
                 num_retries=num_retries,
             )
 
+    @staticmethod
+    def _has_short_retry_after(error: Exception, max_wait: int = 120) -> bool:
+        """
+        Check if a RateLimitError carries a Retry-After header with a short wait.
+
+        Returns True when the provider says "wait N seconds" and N <= max_wait,
+        meaning the deployment will become available soon and the retry loop
+        should be allowed to proceed even when no healthy deployments exist.
+        """
+        response_headers: Optional[httpx.Headers] = None
+        if hasattr(error, "response") and hasattr(error.response, "headers"):  # type: ignore
+            response_headers = error.response.headers  # type: ignore
+        if hasattr(error, "litellm_response_headers"):
+            response_headers = error.litellm_response_headers  # type: ignore
+        if response_headers is None:
+            return False
+        retry_after = _get_retry_after_from_exception_header(response_headers)
+        return retry_after is not None and 0 < retry_after <= max_wait
+
     def should_retry_this_error(
         self,
         error: Exception,
@@ -5955,6 +5975,7 @@ class Router:
         2. raise an exception for RateLimitError if
             - there are no fallbacks
             - there are no healthy deployments in the same model group
+            - UNLESS the error has a short Retry-After header (deployment will recover soon)
         """
         _num_healthy_deployments = 0
         if healthy_deployments is not None and isinstance(healthy_deployments, list):
@@ -5992,7 +6013,12 @@ class Router:
                 and regular_fallbacks is not None  # and fallbacks available
                 and len(regular_fallbacks) > 0
             ):
-                raise error  # then raise the error
+                # If the error carries a short Retry-After, let the retry
+                # loop wait it out instead of immediately raising to the
+                # fallback handler. The deployment will come off cooldown
+                # during the sleep and the next attempt should succeed.
+                if not self._has_short_retry_after(error):
+                    raise error  # then raise the error
 
         if isinstance(error, openai.AuthenticationError):
             """
@@ -6007,6 +6033,14 @@ class Router:
         # Do not retry if there are no healthy deployments
         # just raise the error
         if _num_healthy_deployments <= 0:  # if no healthy deployments
+            # Allow retry for rate-limit errors with a short Retry-After —
+            # the deployment will recover during the backoff sleep.
+            if isinstance(error, openai.RateLimitError) and self._has_short_retry_after(error):
+                verbose_router_logger.info(
+                    "All deployments on cooldown but Retry-After header present — "
+                    "allowing retry loop to wait for recovery"
+                )
+                return True
             raise error
 
         return True
