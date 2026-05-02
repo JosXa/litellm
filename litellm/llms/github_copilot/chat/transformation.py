@@ -130,6 +130,28 @@ class GithubCopilotConfig(OpenAIConfig):
 
         return base_params
 
+    def should_fake_stream(
+        self,
+        model: Optional[str],
+        stream: Optional[bool],
+        custom_llm_provider: Optional[str] = None,
+    ) -> bool:
+        """
+        Force fake streaming for Anthropic models on GitHub Copilot when reasoning
+        is requested.
+
+        GitHub Copilot's upstream Anthropic SSE stream silently strips the
+        reasoning channel: the non-streaming endpoint returns reasoning_text in
+        provider_specific_fields, but the streaming endpoint never emits a
+        corresponding delta. To preserve reasoning end-to-end we ask LiteLLM
+        to perform a single non-streaming upstream call and replay the full
+        response as a synthetic stream so downstream OpenAI-compatible clients
+        receive delta.reasoning_content.
+        """
+        if stream is not True or not model:
+            return False
+        return "claude" in model.lower()
+
     def _determine_initiator(self, messages: List[AllMessageValues]) -> str:
         """
         Determine if request is user or agent initiated based on message roles.

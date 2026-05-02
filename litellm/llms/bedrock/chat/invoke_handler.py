@@ -1995,6 +1995,17 @@ class MockResponseIterator:  # for returning ai21 streaming responses
                 ),
                 index=0,
             )
+            # Surface reasoning_content via provider_specific_fields so the
+            # streaming handler can lift it onto delta.reasoning_content. This
+            # is what makes a fake-streamed Anthropic response (e.g. coming
+            # from the GitHub Copilot bridge, where the upstream stream drops
+            # the reasoning channel) emit a real reasoning delta downstream.
+            _msg = chunk_data.choices[0].message
+            _rc = getattr(_msg, "reasoning_content", None)
+            if _rc:
+                processed_chunk["provider_specific_fields"] = {
+                    "reasoning_content": _rc,
+                }
             return processed_chunk
         except Exception as e:
             raise ValueError(f"Failed to decode chunk: {chunk_data}. Error: {e}")

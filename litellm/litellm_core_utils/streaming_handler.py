@@ -1183,6 +1183,14 @@ class CustomStreamWrapper:
                         "provider_specific_fields"
                     ].items():
                         setattr(model_response, key, value)
+                        # Lift reasoning_content from a fake-streamed Anthropic
+                        # response onto the delta so SSE chunks carry a real
+                        # delta.reasoning_content for OpenAI-compatible clients.
+                        # Without this, the reasoning lands on the
+                        # ModelResponseStream root attr and never reaches
+                        # downstream consumers.
+                        if key == "reasoning_content" and value:
+                            completion_obj["reasoning_content"] = value
 
                 response_obj = cast(Dict[str, Any], anthropic_response_obj)
             elif self.model == "replicate" or self.custom_llm_provider == "replicate":

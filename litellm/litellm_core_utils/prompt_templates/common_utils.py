@@ -1309,6 +1309,17 @@ def _extract_reasoning_content(message: dict) -> Tuple[Optional[str], Optional[s
         return message["reasoning_content"], message_content
     elif "reasoning" in message:
         return message["reasoning"], message_content
+    # Lift reasoning_text emitted by OpenAI-compatible Anthropic endpoints
+    # (e.g. GitHub Copilot Enterprise). The upstream surfaces it as a top-level
+    # field which downstream conversion otherwise drops on the floor.
+    elif isinstance(message.get("reasoning_text"), str) and message["reasoning_text"]:
+        return message["reasoning_text"], message_content
+    elif (
+        isinstance(message.get("provider_specific_fields"), dict)
+        and isinstance(message["provider_specific_fields"].get("reasoning_text"), str)
+        and message["provider_specific_fields"]["reasoning_text"]
+    ):
+        return message["provider_specific_fields"]["reasoning_text"], message_content
     elif isinstance(message_content, str):
         return _parse_content_for_reasoning(message_content)
     return None, message_content
