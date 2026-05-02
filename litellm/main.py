@@ -975,15 +975,28 @@ def responses_api_bridge_check(
             mode = "responses"
             model_info["mode"] = mode
 
-    # OpenAI/Azure/ChatGPT gpt-5.4+ chat-completions calls with both tools + reasoning_effort
-    # must be bridged to Responses API. "chatgpt" provider added so ChatGPT/Codex
-    # streams also get bridged (otherwise they fall through to chat-completions and
-    # produce empty/inconsistent streams).
+    # OpenAI/Azure/ChatGPT gpt-5.4+ chat-completions calls with both tools +
+    # reasoning_effort must be bridged to Responses API. "chatgpt" provider
+    # added so ChatGPT/Codex streams also get bridged (otherwise they fall
+    # through to chat-completions and produce empty/inconsistent streams).
     if (
         custom_llm_provider in ("openai", "azure", "chatgpt")
         and OpenAIGPT5Config.is_model_gpt_5_4_plus_model(model)
         and tools
         and reasoning_effort is not None
+        and model_info.get("mode") != "responses"
+    ):
+        model_info["mode"] = "responses"
+        model = model.replace("responses/", "")
+
+    # GitHub Copilot Enterprise gpt-5.4+ rejects tool-bearing Chat
+    # Completions requests outright, regardless of reasoning_effort. Route
+    # all tool-using turns through Responses so callers don't need provider-
+    # specific request surgery (dropping reasoning_effort or capping tools).
+    if (
+        custom_llm_provider == "github_copilot"
+        and OpenAIGPT5Config.is_model_gpt_5_4_plus_model(model)
+        and tools
         and model_info.get("mode") != "responses"
     ):
         model_info["mode"] = "responses"
