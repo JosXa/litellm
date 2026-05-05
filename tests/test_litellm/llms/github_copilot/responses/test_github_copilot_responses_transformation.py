@@ -359,6 +359,98 @@ class TestGithubCopilotResponsesAPITransformation:
         assert result.get("type") == "reasoning"
         assert result.get("id") == "reasoning-456"
 
+    def test_stabilize_item_ids_rewrites_rotating_reasoning_ids(self):
+        """
+        Regression for the gpt-5.4-copilot end-to-end Responses path.
+
+        Copilot rotates the encrypted item_id on every reasoning_summary_*
+        and output_item.* event. AI SDK keys reasoning state on item_id, so
+        a delta with a different item_id than its summary_part.added causes
+        `reasoning part <id> not found`. Stabilizing per output_index fixes
+        the AI SDK state machine without changing summary_index semantics.
+        """
+        added = {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "rs_rotating_blob_A",
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": "ENCRYPTED_BLOB",
+            },
+        }
+        delta = {
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "item_id": "rs_rotating_blob_B",
+            "summary_index": 0,
+            "delta": "thinking",
+        }
+        done = {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "rs_rotating_blob_C",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "ok"}],
+                "encrypted_content": "ENCRYPTED_BLOB",
+            },
+        }
+
+        out_added = GithubCopilotResponsesAPIConfig._stabilize_item_ids(added)
+        out_delta = GithubCopilotResponsesAPIConfig._stabilize_item_ids(delta)
+        out_done = GithubCopilotResponsesAPIConfig._stabilize_item_ids(done)
+
+        assert out_added["item"]["id"] == "copilot_item_0"
+        assert out_delta["item_id"] == "copilot_item_0"
+        assert out_done["item"]["id"] == "copilot_item_0"
+        # encrypted_content must round-trip untouched for multi-turn state
+        assert out_added["item"]["encrypted_content"] == "ENCRYPTED_BLOB"
+        assert out_done["item"]["encrypted_content"] == "ENCRYPTED_BLOB"
+        # original chunks must not be mutated in place
+        assert added["item"]["id"] == "rs_rotating_blob_A"
+        assert delta["item_id"] == "rs_rotating_blob_B"
+
+    def test_stabilize_item_ids_uses_output_index_for_function_call(self):
+        """Function-call streams must stabilize on their own output_index."""
+        fn_added = {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_rotating_X",
+                "type": "function_call",
+                "name": "get_weather",
+                "arguments": "",
+                "call_id": "call_abc",
+            },
+        }
+        fn_delta = {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_rotating_Y",
+            "delta": '{"city":"Berlin"}',
+        }
+
+        s_added = GithubCopilotResponsesAPIConfig._stabilize_item_ids(fn_added)
+        s_delta = GithubCopilotResponsesAPIConfig._stabilize_item_ids(fn_delta)
+
+        assert s_added["item"]["id"] == "copilot_item_1"
+        assert s_delta["item_id"] == "copilot_item_1"
+        # call_id is the round-trippable tool-call identifier and must not
+        # be conflated with the rewritten item.id
+        assert s_added["item"]["call_id"] == "call_abc"
+
+    def test_stabilize_item_ids_passthrough_without_output_index(self):
+        """Lifecycle events have no per-item ID to rewrite."""
+        created = {"type": "response.created", "response": {"id": "resp_1"}}
+        in_progress = {"type": "response.in_progress"}
+        completed = {"type": "response.completed", "response": {"id": "resp_1"}}
+
+        for chunk in (created, in_progress, completed):
+            assert (
+                GithubCopilotResponsesAPIConfig._stabilize_item_ids(chunk) is chunk
+            ), "events without output_index must be returned unchanged"
+
     def test_handle_reasoning_item_non_reasoning_passthrough(self):
         """Test _handle_reasoning_item passes through non-reasoning items unchanged"""
         config = GithubCopilotResponsesAPIConfig()

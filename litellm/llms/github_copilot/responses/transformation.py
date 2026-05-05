@@ -175,6 +175,84 @@ class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
         # Return the responses endpoint
         return f"{effective_api_base}/responses"
 
+    def transform_streaming_response(
+        self,
+        model: str,
+        parsed_chunk: dict,
+        logging_obj: LiteLLMLoggingObj,
+    ):
+        """
+        Stabilize per-event item IDs before delegating to the parent transform.
+
+        GitHub Copilot's Responses API rotates the encrypted ``item_id`` (and
+        the nested ``item.id`` on ``response.output_item.added``/``.done``)
+        on every SSE event, even within the same logical output item. Strict
+        clients like ``@ai-sdk/openai`` key their reasoning state machine on
+        ``${item_id}:${summary_index}``, so a ``reasoning_summary_text.delta``
+        whose ``item_id`` differs from the earlier
+        ``reasoning_summary_part.added`` causes ``reasoning part <id> not
+        found`` errors in the AI SDK ``streamText`` state machine. The same
+        problem can manifest for tool-call argument streams.
+
+        Normalize all per-event IDs to a stable per-``output_index`` value so
+        one logical reasoning or function-call item shares one ID across the
+        stream. The original ``encrypted_content`` blob is preserved
+        separately on the final ``output_item.done`` so multi-turn
+        ``encrypted_content`` continues to round-trip via
+        :meth:`_handle_reasoning_item` on the next request.
+        """
+        stabilized = self._stabilize_item_ids(parsed_chunk)
+        return super().transform_streaming_response(
+            model=model,
+            parsed_chunk=stabilized,
+            logging_obj=logging_obj,
+        )
+
+    @staticmethod
+    def _stabilize_item_ids(parsed_chunk: dict) -> dict:
+        """
+        Return a shallow copy of ``parsed_chunk`` with rotating Copilot item
+        IDs replaced by ``f"copilot_item_{output_index}"``.
+
+        ``output_index`` is the right stabilizing key because the OpenAI
+        Responses event schema guarantees one ``output_index`` per logical
+        output item across every event for that item (``output_item.added``,
+        ``content_part.*``, ``reasoning_summary_*``,
+        ``function_call_arguments.*``, ``output_item.done``). Copilot
+        rotates the *encrypted* ``item_id`` blob per event but does not
+        change ``output_index``, so collapsing on it is both safe and
+        sufficient.
+
+        Only the ``item_id`` (top-level) and ``item.id`` (nested) fields are
+        rewritten. Everything else, including ``item.encrypted_content`` and
+        ``item.summary``, is left untouched so downstream multi-turn state
+        preservation via :meth:`_handle_reasoning_item` continues to work.
+
+        Events that lack ``output_index`` (for example ``response.created``,
+        ``response.in_progress``, ``response.completed``) are returned
+        unchanged since there is no per-item ID to stabilize.
+        """
+        if not isinstance(parsed_chunk, dict):
+            return parsed_chunk
+
+        output_index = parsed_chunk.get("output_index")
+        if output_index is None:
+            return parsed_chunk
+
+        stable_id = f"copilot_item_{output_index}"
+
+        rewritten = dict(parsed_chunk)
+        if "item_id" in rewritten:
+            rewritten["item_id"] = stable_id
+
+        item = rewritten.get("item")
+        if isinstance(item, dict) and "id" in item:
+            item = dict(item)
+            item["id"] = stable_id
+            rewritten["item"] = item
+
+        return rewritten
+
     def _handle_reasoning_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """
         Handle reasoning items for GitHub Copilot, preserving encrypted_content.
