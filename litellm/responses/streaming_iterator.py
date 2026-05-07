@@ -76,6 +76,9 @@ class BaseResponsesAPIStreamingIterator:
         self._completed_response_cache_hit: Optional[bool] = None
         self._persist_completed_response_before_logging = True
         self._stream_created_time: float = time.time()
+        self._pending_events: List[Any] = []
+        self._buffered_reasoning_events: Dict[str, List[Any]] = {}
+        self._reasoning_item_ids_with_summary_text: set[str] = set()
 
         # track request context for hooks
         self.litellm_metadata = litellm_metadata
@@ -102,6 +105,185 @@ class BaseResponsesAPIStreamingIterator:
         self._hidden_params["additional_headers"] = process_response_headers(
             self.response.headers or {}
         )  # GUARANTEE OPENAI HEADERS IN RESPONSE
+
+    @staticmethod
+    def _get_attr(value: Any, field: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(field, default)
+        return getattr(value, field, default)
+
+    @staticmethod
+    def _set_attr(value: Any, field: str, new_value: Any) -> None:
+        if isinstance(value, dict):
+            value[field] = new_value
+        else:
+            setattr(value, field, new_value)
+
+    @staticmethod
+    def _event_type_to_str(event: Any) -> Optional[str]:
+        event_type = getattr(event, "type", None)
+        if hasattr(event_type, "value"):
+            return str(event_type.value)
+        if event_type is None:
+            return None
+        return str(event_type)
+
+    def _get_reasoning_summary_text(self, item: Any) -> str:
+        summaries = self._get_attr(item, "summary", []) or []
+        if not isinstance(summaries, list):
+            return ""
+
+        parts: List[str] = []
+        for summary in summaries:
+            if self._get_attr(summary, "type") != "summary_text":
+                continue
+            text = self._get_attr(summary, "text", "")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+
+        return "".join(parts)
+
+    def _has_non_empty_reasoning_summary(self, item: Any) -> bool:
+        return bool(self._get_reasoning_summary_text(item))
+
+    def _event_has_non_empty_reasoning_text(self, event: Any) -> bool:
+        event_type = self._event_type_to_str(event)
+        if event_type == "response.reasoning_summary_text.delta":
+            delta = self._get_attr(event, "delta", "")
+            return isinstance(delta, str) and bool(delta)
+        if event_type == "response.reasoning_summary_text.done":
+            text = self._get_attr(event, "text", "")
+            return isinstance(text, str) and bool(text.strip())
+        if event_type == "response.reasoning_summary_part.done":
+            part = self._get_attr(event, "part")
+            text = self._get_attr(part, "text", "")
+            return isinstance(text, str) and bool(text.strip())
+        return False
+
+    def _pop_pending_event(self) -> Optional[Any]:
+        if not self._pending_events:
+            return None
+        return self._pending_events.pop(0)
+
+    def _flush_buffered_reasoning_events(
+        self, item_id: str, trailing_event: Any
+    ) -> Any:
+        self._reasoning_item_ids_with_summary_text.add(item_id)
+        self._pending_events.extend(self._buffered_reasoning_events.pop(item_id, []))
+        self._pending_events.append(trailing_event)
+        return self._pop_pending_event()
+
+    def _sanitize_terminal_response_reasoning_output(self, event: Any) -> None:
+        response = self._get_attr(event, "response")
+        output = self._get_attr(response, "output")
+        if not isinstance(output, list):
+            return
+
+        filtered_output = []
+        for item in output:
+            if self._get_attr(item, "type") != "reasoning":
+                filtered_output.append(item)
+                continue
+
+            item_id = self._get_attr(item, "id")
+            if (
+                isinstance(item_id, str)
+                and item_id in self._reasoning_item_ids_with_summary_text
+            ):
+                filtered_output.append(item)
+                continue
+
+            if self._has_non_empty_reasoning_summary(item):
+                if isinstance(item_id, str):
+                    self._reasoning_item_ids_with_summary_text.add(item_id)
+                filtered_output.append(item)
+
+        self._set_attr(response, "output", filtered_output)
+
+    def _filter_empty_reasoning_stream_event(self, event: Any) -> Optional[Any]:
+        event_type = self._event_type_to_str(event)
+        if event_type is None:
+            return event
+
+        if event_type == "response.output_item.added":
+            item = self._get_attr(event, "item")
+            if self._get_attr(item, "type") != "reasoning":
+                return event
+
+            item_id = self._get_attr(item, "id")
+            if not isinstance(item_id, str):
+                return event
+
+            if self._has_non_empty_reasoning_summary(item):
+                self._reasoning_item_ids_with_summary_text.add(item_id)
+                return event
+
+            self._buffered_reasoning_events[item_id] = [event]
+            return None
+
+        if event_type == "response.reasoning_summary_part.added":
+            item_id = self._get_attr(event, "item_id")
+            if (
+                isinstance(item_id, str)
+                and item_id in self._buffered_reasoning_events
+                and item_id not in self._reasoning_item_ids_with_summary_text
+            ):
+                self._buffered_reasoning_events[item_id].append(event)
+                return None
+            return event
+
+        if event_type in (
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+        ):
+            item_id = self._get_attr(event, "item_id")
+            if not isinstance(item_id, str):
+                return event
+
+            if item_id in self._buffered_reasoning_events:
+                if not self._event_has_non_empty_reasoning_text(event):
+                    return None
+                return self._flush_buffered_reasoning_events(item_id, event)
+
+            if self._event_has_non_empty_reasoning_text(event):
+                self._reasoning_item_ids_with_summary_text.add(item_id)
+            return event
+
+        if event_type == "response.output_item.done":
+            item = self._get_attr(event, "item")
+            if self._get_attr(item, "type") != "reasoning":
+                return event
+
+            item_id = self._get_attr(item, "id")
+            if not isinstance(item_id, str):
+                return event
+
+            has_summary = self._has_non_empty_reasoning_summary(item)
+            if item_id in self._buffered_reasoning_events:
+                if not has_summary:
+                    self._buffered_reasoning_events.pop(item_id, None)
+                    return None
+                return self._flush_buffered_reasoning_events(item_id, event)
+
+            if has_summary:
+                self._reasoning_item_ids_with_summary_text.add(item_id)
+                return event
+
+            if item_id not in self._reasoning_item_ids_with_summary_text:
+                return None
+            return event
+
+        if event_type in (
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        ):
+            self._sanitize_terminal_response_reasoning_output(event)
+            self._buffered_reasoning_events.clear()
+            return event
+
+        return event
 
     def _check_max_streaming_duration(self) -> None:
         """Raise litellm.Timeout if the stream has exceeded LITELLM_MAX_STREAMING_DURATION_SECONDS."""
@@ -235,6 +417,12 @@ class BaseResponsesAPIStreamingIterator:
                                         encrypted_content, model_id
                                     )
                                     setattr(item, "encrypted_content", wrapped_content)
+
+                openai_responses_api_chunk = self._filter_empty_reasoning_stream_event(
+                    openai_responses_api_chunk
+                )
+                if openai_responses_api_chunk is None:
+                    return self._pop_pending_event()
 
                 # Store the completed response (also for incomplete/failed so logging still fires)
                 _chunk_type = getattr(openai_responses_api_chunk, "type", None)
@@ -643,6 +831,13 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         try:
             self._check_max_streaming_duration()
             while True:
+                pending_event = self._pop_pending_event()
+                if pending_event is not None:
+                    pending_event = await self._call_post_streaming_deployment_hook(
+                        chunk=pending_event,
+                    )
+                    return pending_event
+
                 # Get the next chunk from the stream
                 try:
                     chunk = await self.stream_iterator.__anext__()
@@ -717,6 +912,14 @@ class SyncResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         try:
             self._check_max_streaming_duration()
             while True:
+                pending_event = self._pop_pending_event()
+                if pending_event is not None:
+                    pending_event = run_async_function(
+                        async_function=self._call_post_streaming_deployment_hook,
+                        chunk=pending_event,
+                    )
+                    return pending_event
+
                 # Get the next chunk from the stream
                 try:
                     chunk = next(self.stream_iterator)

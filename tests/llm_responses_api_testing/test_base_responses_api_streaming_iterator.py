@@ -34,7 +34,11 @@ from litellm.types.llms.openai import (
     ResponseIncompleteEvent,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
+    OutputItemAddedEvent,
+    OutputItemDoneEvent,
     OutputTextDeltaEvent,
+    ReasoningSummaryPartDoneEvent,
+    ReasoningSummaryTextDeltaEvent,
 )
 
 
@@ -225,6 +229,249 @@ class TestBaseResponsesAPIStreamingIterator:
         # Should return None and set finished flag
         assert result is None
         assert iterator.finished is True
+
+    def test_process_chunk_drops_empty_reasoning_lifecycle_and_sanitizes_completed_response(
+        self,
+    ):
+        """Empty reasoning item lifecycles should not surface to clients."""
+
+        mock_response = Mock()
+        mock_response.headers = {}
+        mock_logging_obj = Mock(spec=LiteLLMLoggingObj)
+        mock_logging_obj.model_call_details = {"litellm_params": {}}
+        mock_config = Mock(spec=BaseResponsesAPIConfig)
+
+        reasoning_added = OutputItemAddedEvent.model_validate(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_empty"},
+            }
+        )
+        reasoning_done = OutputItemDoneEvent.model_validate(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_empty",
+                    "summary": [{"type": "summary_text", "text": ""}],
+                },
+            }
+        )
+        completed_event = ResponseCompletedEvent.model_validate(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "created_at": 1700000000,
+                    "status": "completed",
+                    "model": "gpt-5.5-europe",
+                    "object": "response",
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_empty",
+                            "summary": [{"type": "summary_text", "text": ""}],
+                        },
+                        {
+                            "type": "message",
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": "Done"}],
+                        },
+                    ],
+                },
+            }
+        )
+
+        mock_config.transform_streaming_response.side_effect = [
+            reasoning_added,
+            reasoning_done,
+            completed_event,
+        ]
+
+        iterator = BaseResponsesAPIStreamingIterator(
+            response=mock_response,
+            model="gpt-5.5-europe",
+            responses_api_provider_config=mock_config,
+            logging_obj=mock_logging_obj,
+            litellm_metadata={"model_info": {"id": "model_123"}},
+            custom_llm_provider="azure",
+        )
+
+        assert (
+            iterator._process_chunk(
+                json.dumps(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {"type": "reasoning", "id": "rs_empty"},
+                    }
+                )
+            )
+            is None
+        )
+        assert (
+            iterator._process_chunk(
+                json.dumps(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "reasoning",
+                            "id": "rs_empty",
+                            "summary": [{"type": "summary_text", "text": ""}],
+                        },
+                    }
+                )
+            )
+            is None
+        )
+
+        final_event = iterator._process_chunk(
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_1"},
+                }
+            )
+        )
+
+        assert final_event is not None
+        assert final_event.type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+        output_items = final_event.response.output
+        assert len(output_items) == 1
+        remaining_type = (
+            output_items[0].get("type")
+            if isinstance(output_items[0], dict)
+            else getattr(output_items[0], "type", None)
+        )
+        assert remaining_type == "message"
+
+    def test_process_chunk_preserves_non_empty_reasoning_lifecycle(self):
+        """Non-empty reasoning summary events should still pass through."""
+
+        mock_response = Mock()
+        mock_response.headers = {}
+        mock_logging_obj = Mock(spec=LiteLLMLoggingObj)
+        mock_logging_obj.model_call_details = {"litellm_params": {}}
+        mock_config = Mock(spec=BaseResponsesAPIConfig)
+
+        reasoning_added = OutputItemAddedEvent.model_validate(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_full"},
+            }
+        )
+        reasoning_delta = ReasoningSummaryTextDeltaEvent.model_validate(
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_full",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "Visible reasoning text.",
+            }
+        )
+        reasoning_part_done = ReasoningSummaryPartDoneEvent.model_construct(
+            type=ResponsesAPIStreamEvents.REASONING_SUMMARY_PART_DONE,
+            item_id="rs_full",
+            output_index=0,
+            summary_index=0,
+            sequence_number=1,
+            part={"type": "summary_text", "text": "Visible reasoning text."},
+        )
+        reasoning_done = OutputItemDoneEvent.model_validate(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_full",
+                    "summary": [
+                        {"type": "summary_text", "text": "Visible reasoning text."}
+                    ],
+                },
+            }
+        )
+
+        mock_config.transform_streaming_response.side_effect = [
+            reasoning_added,
+            reasoning_delta,
+            reasoning_part_done,
+            reasoning_done,
+        ]
+
+        iterator = BaseResponsesAPIStreamingIterator(
+            response=mock_response,
+            model="gpt-5.5-europe",
+            responses_api_provider_config=mock_config,
+            logging_obj=mock_logging_obj,
+            litellm_metadata={"model_info": {"id": "model_123"}},
+            custom_llm_provider="azure",
+        )
+
+        added_event = iterator._process_chunk(
+            json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "rs_full"},
+                }
+            )
+        )
+        flushed_added_event = iterator._process_chunk(
+            json.dumps(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_full",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "Visible reasoning text.",
+                }
+            )
+        )
+        delta_event = iterator._pop_pending_event()
+        part_done_event = iterator._process_chunk(
+            json.dumps(
+                {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": "rs_full",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": "Visible reasoning text."},
+                }
+            )
+        )
+        done_event = iterator._process_chunk(
+            json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_full",
+                        "summary": [
+                            {"type": "summary_text", "text": "Visible reasoning text."}
+                        ],
+                    },
+                }
+            )
+        )
+
+        assert added_event is None
+        assert flushed_added_event is not None
+        assert flushed_added_event.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
+        assert delta_event is not None
+        assert delta_event.type == ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA
+        assert part_done_event is not None
+        assert (
+            part_done_event.type == ResponsesAPIStreamEvents.REASONING_SUMMARY_PART_DONE
+        )
+        assert done_event is not None
+        assert done_event.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
 
     def test_process_chunk_handles_empty_chunk(self):
         """

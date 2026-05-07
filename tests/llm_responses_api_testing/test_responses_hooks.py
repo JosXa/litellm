@@ -312,16 +312,28 @@ def test_process_chunk_wraps_encrypted_content_with_model_id():
     openai_types = streaming_module._get_openai_response_types()
 
     class _EncryptedConfig:
-        def transform_streaming_response(self, **kwargs):
-            return openai_types.OutputItemAddedEvent(
-                type=openai_types.ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
-                output_index=0,
-                item=openai_types.BaseLiteLLMOpenAIResponseObject(
-                    id="rs_123",
-                    type="reasoning",
-                    encrypted_content="ciphertext",
+        def __init__(self):
+            self._events = [
+                openai_types.OutputItemAddedEvent(
+                    type=openai_types.ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+                    output_index=0,
+                    item=openai_types.BaseLiteLLMOpenAIResponseObject(
+                        id="rs_123",
+                        type="reasoning",
+                        encrypted_content="ciphertext",
+                    ),
                 ),
-            )
+                openai_types.ReasoningSummaryTextDeltaEvent(
+                    type=openai_types.ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA,
+                    item_id="rs_123",
+                    output_index=0,
+                    summary_index=0,
+                    delta="visible reasoning",
+                ),
+            ]
+
+        def transform_streaming_response(self, **kwargs):
+            return self._events.pop(0)
 
     iterator = ResponsesAPIStreamingIterator(
         response=httpx.Response(200),
@@ -336,7 +348,22 @@ def test_process_chunk_wraps_encrypted_content_with_model_id():
         call_type=CallTypes.responses.value,
     )
 
-    event = iterator._process_chunk(json.dumps({"type": "response.output_item.added"}))
+    first_event = iterator._process_chunk(
+        json.dumps({"type": "response.output_item.added"})
+    )
+    assert first_event is None
+
+    event = iterator._process_chunk(
+        json.dumps(
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_123",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "visible reasoning",
+            }
+        )
+    )
 
     assert event.item.encrypted_content.startswith("litellm_enc:")
     assert event.item.encrypted_content.endswith(";ciphertext")
@@ -387,9 +414,7 @@ def test_process_chunk_completed_response_updates_id_and_usage_cost(monkeypatch)
         # Chunk must include a top-level "response" key so BaseResponsesAPIStreamingIterator
         # runs _update_responses_api_response_id_with_model_id (see streaming_iterator.py).
         event = iterator._process_chunk(
-            json.dumps(
-                {"type": "response.completed", "response": {"id": "resp_live"}}
-            )
+            json.dumps({"type": "response.completed", "response": {"id": "resp_live"}})
         )
     finally:
         litellm.include_cost_in_streaming_usage = original_include_cost
