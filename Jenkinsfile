@@ -1,11 +1,7 @@
-// TeamViewer LiteLLM fork build pipeline.
-//
-// Mirrors MCO/Publish web-api-swagger-docs (the reference job we copied),
-// adapted for the litellm repo where the Dockerfile is at the repo root and
-// the image is published to acrplatform2global1.azurecr.io/custom-images/litellm.
-//
-// The image tag is `<branch>-<shortSha>-<utcStamp>` so it's always unique and
-// argocd-environments can pin to an exact build.
+// Builds the TeamViewer LiteLLM fork and publishes the resulting image to
+// acrplatform2global1.azurecr.io/custom-images/litellm. Image tag mirrors the
+// upstream litellm version with a `-tv.<BUILD_NUMBER>` SemVer pre-release
+// suffix so each TV build is uniquely addressable from argocd-environments.
 pipeline {
     options {
         ansiColor('xterm')
@@ -28,12 +24,18 @@ pipeline {
             }
             steps {
                 script {
-                    def imageName = "litellm"
-                    def shortSha = sh(script: "git rev-parse --short=10 HEAD", returnStdout: true).trim()
-                    def stamp = new Date().format("yyyyMMdd-HHmmss", TimeZone.getTimeZone("UTC"))
-                    def safeBranch = (env.BRANCH_NAME ?: "unknown").replaceAll("[^A-Za-z0-9_.-]", "-")
-                    def tag = "${safeBranch}-${shortSha}-${stamp}"
-                    def fullImageName = "acrplatform2global1.azurecr.io/custom-images/${imageName}:${tag}"
+                    def litellmVersion = sh(
+                        script: "grep -m1 '^version' pyproject.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\1/'",
+                        returnStdout: true
+                    ).trim()
+                    if (!(litellmVersion ==~ /\d+\.\d+\.\d+/)) {
+                        error("Could not parse litellm version from pyproject.toml (got: '${litellmVersion}')")
+                    }
+
+                    def safeBranch = (env.BRANCH_NAME ?: "unknown").replaceAll("[^A-Za-z0-9.]", "-")
+                    def base = "v${litellmVersion}-tv.${env.BUILD_NUMBER}"
+                    def tag = (safeBranch == "main") ? base : "${base}-${safeBranch}"
+                    def fullImageName = "acrplatform2global1.azurecr.io/custom-images/litellm:${tag}"
 
                     sh "docker build -t ${fullImageName} ."
 
