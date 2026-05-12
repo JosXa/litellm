@@ -25,7 +25,11 @@ RUN apk add --no-cache \
     openssl-dev \
     nodejs \
     npm \
-    libsndfile
+    libsndfile && \
+    npm config set fetch-retries 10 && \
+    npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-timeout 600000
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \
@@ -58,7 +62,17 @@ RUN uv sync --frozen --no-default-groups --no-editable \
     --extra semantic-router \
     --python python3
 
-RUN prisma generate --schema=./schema.prisma
+# Configure npm fetch resilience for the prisma-python CLI which shells out
+# to `npm install prisma@<v>` and otherwise dies on the first ECONNRESET to
+# registry.npmjs.org (observed flakiness on lnxbuildvm).
+RUN npm config set fetch-retries 10 && \
+    npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-timeout 600000
+
+RUN for i in 1 2 3 4 5; do \
+        prisma generate --schema=./schema.prisma && break || sleep $((i*15)); \
+    done
 
 RUN sed -i 's/\r$//' docker/entrypoint.sh && chmod +x docker/entrypoint.sh && \
     sed -i 's/\r$//' docker/prod_entrypoint.sh && chmod +x docker/prod_entrypoint.sh
