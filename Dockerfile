@@ -13,6 +13,15 @@ FROM $LITELLM_BUILD_IMAGE AS builder
 WORKDIR /app
 USER root
 
+# [TV] Route all npm traffic through TeamViewer's Artifactory npm-remote proxy.
+# The chainguard/wolfi base image has flaky direct connectivity to
+# registry.npmjs.org from the lnxbuildvm Jenkins agent, causing ECONNRESETs
+# during `npm install -g …` (runtime stage) and `prisma generate`'s internal
+# `npm install prisma@<v>` shell-out (builder stage). The Artifactory proxy
+# is the same one used by remax-ui and other internal Jenkins jobs; read
+# access is unauthenticated. Promoted to ENV so prisma-python inherits it.
+ENV npm_config_registry=https://artifactory01.tvcorp.org/artifactory/api/npm/npm-remote/
+
 COPY --from=uvbin /uv /usr/local/bin/uv
 COPY --from=uvbin /uvx /usr/local/bin/uvx
 
@@ -25,11 +34,7 @@ RUN apk add --no-cache \
     openssl-dev \
     nodejs \
     npm \
-    libsndfile && \
-    npm config set fetch-retries 10 && \
-    npm config set fetch-retry-mintimeout 20000 && \
-    npm config set fetch-retry-maxtimeout 120000 && \
-    npm config set fetch-timeout 600000
+    libsndfile
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \
@@ -62,17 +67,7 @@ RUN uv sync --frozen --no-default-groups --no-editable \
     --extra semantic-router \
     --python python3
 
-# Configure npm fetch resilience for the prisma-python CLI which shells out
-# to `npm install prisma@<v>` and otherwise dies on the first ECONNRESET to
-# registry.npmjs.org (observed flakiness on lnxbuildvm).
-RUN npm config set fetch-retries 10 && \
-    npm config set fetch-retry-mintimeout 20000 && \
-    npm config set fetch-retry-maxtimeout 120000 && \
-    npm config set fetch-timeout 600000
-
-RUN for i in 1 2 3 4 5; do \
-        prisma generate --schema=./schema.prisma && break || sleep $((i*15)); \
-    done
+RUN prisma generate --schema=./schema.prisma
 
 RUN sed -i 's/\r$//' docker/entrypoint.sh && chmod +x docker/entrypoint.sh && \
     sed -i 's/\r$//' docker/prod_entrypoint.sh && chmod +x docker/prod_entrypoint.sh
@@ -82,14 +77,11 @@ FROM $LITELLM_RUNTIME_IMAGE AS runtime
 
 USER root
 
+# [TV] Route runtime-stage npm through Artifactory (see builder stage comment).
+ENV npm_config_registry=https://artifactory01.tvcorp.org/artifactory/api/npm/npm-remote/
+
 RUN apk add --no-cache bash openssl tzdata nodejs npm python3 libsndfile supervisor && \
-    npm config set fetch-retries 10 && \
-    npm config set fetch-retry-mintimeout 20000 && \
-    npm config set fetch-retry-maxtimeout 120000 && \
-    npm config set fetch-timeout 600000 && \
-    for i in 1 2 3 4 5; do \
-        npm install -g npm@11.12.1 tar@7.5.11 glob@13.0.6 @isaacs/brace-expansion@5.0.1 brace-expansion@5.0.5 minimatch@10.2.4 diff@8.0.3 picomatch@4.0.4 && break || sleep $((i*10)); \
-    done && \
+    npm install -g npm@11.12.1 tar@7.5.11 glob@13.0.6 @isaacs/brace-expansion@5.0.1 brace-expansion@5.0.5 minimatch@10.2.4 diff@8.0.3 picomatch@4.0.4 && \
     GLOBAL="$(npm root -g)" && \
     for pkg in tar glob @isaacs/brace-expansion brace-expansion minimatch diff picomatch; do \
         name="${pkg##*/}"; \
