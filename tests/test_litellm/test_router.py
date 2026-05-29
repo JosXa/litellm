@@ -12,6 +12,67 @@ sys.path.insert(
 
 
 import litellm
+from litellm.types.router import Deployment
+from litellm.utils import supports_native_streaming
+
+
+def test_router_registers_prefixed_azure_model_without_double_provider_prefix():
+    litellm.model_cost.pop("azure/gpt-5.5-global", None)
+    litellm.model_cost.pop("azure/azure/gpt-5.5-global", None)
+
+    litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-5.5-global",
+                "litellm_params": {
+                    "model": "azure/gpt-5.5-global",
+                    "custom_llm_provider": "azure",
+                    "api_key": "test-key",
+                    "api_base": "https://example.openai.azure.com",
+                    "api_version": "preview",
+                },
+                "model_info": {
+                    "max_input_tokens": 1050000,
+                    "max_output_tokens": 128000,
+                    "input_cost_per_token": 0.000005,
+                    "output_cost_per_token": 0.000030,
+                },
+            }
+        ]
+    )
+
+    assert "azure/gpt-5.5-global" in litellm.model_cost
+    assert "azure/azure/gpt-5.5-global" not in litellm.model_cost
+    assert supports_native_streaming("azure/gpt-5.5-global", "azure") is True
+
+
+def test_router_upsert_registers_shared_backend_model_cost_key():
+    litellm.model_cost.pop("azure/gpt-5.5-global", None)
+    litellm.model_cost.pop("azure/azure/gpt-5.5-global", None)
+
+    router = litellm.Router(model_list=[])
+    router.upsert_deployment(
+        Deployment(
+            model_name="gpt-5.5-global",
+            litellm_params={
+                "model": "azure/gpt-5.5-global",
+                "custom_llm_provider": "azure",
+                "api_key": "test-key",
+                "api_base": "https://example.openai.azure.com",
+                "api_version": "preview",
+            },
+            model_info={
+                "max_input_tokens": 1050000,
+                "max_output_tokens": 128000,
+                "input_cost_per_token": 0.000005,
+                "output_cost_per_token": 0.000030,
+            },
+        )
+    )
+
+    assert "azure/gpt-5.5-global" in litellm.model_cost
+    assert "azure/azure/gpt-5.5-global" not in litellm.model_cost
+    assert supports_native_streaming("azure/gpt-5.5-global", "azure") is True
 
 
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():

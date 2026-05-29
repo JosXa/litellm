@@ -218,6 +218,19 @@ else:
     PreRoutingHookResponse = Any
 
 
+def _get_model_cost_registration_key(
+    model: str, custom_llm_provider: Optional[str]
+) -> str:
+    if custom_llm_provider is None:
+        return model
+
+    provider_prefix = f"{custom_llm_provider}/"
+    if model.startswith(provider_prefix):
+        return model
+
+    return provider_prefix + model
+
+
 class RoutingArgs(enum.Enum):
     ttl = 60  # 1min (RPM/TPM expire key)
 
@@ -6817,11 +6830,10 @@ class Router:
                 )
 
             ## OLD MODEL REGISTRATION ## Kept to prevent breaking changes
-            _model_name = deployment.litellm_params.model
-            if deployment.litellm_params.custom_llm_provider is not None:
-                _model_name = (
-                    deployment.litellm_params.custom_llm_provider + "/" + _model_name
-                )
+            _model_name = _get_model_cost_registration_key(
+                model=deployment.litellm_params.model,
+                custom_llm_provider=deployment.litellm_params.custom_llm_provider,
+            )
 
             # For the shared backend key, strip custom pricing fields so that
             # one deployment's pricing overrides don't pollute another
@@ -7521,6 +7533,18 @@ class Router:
                 if field_value is not None:
                     _model_info_dict[field] = field_value
             litellm.register_model(model_cost={_model_id: _model_info_dict})
+
+        _model_name = _get_model_cost_registration_key(
+            model=deployment.litellm_params.model,
+            custom_llm_provider=deployment.litellm_params.custom_llm_provider,
+        )
+        _custom_pricing_fields = CustomPricingLiteLLMParams.model_fields.keys()
+        _shared_model_info = {
+            k: v
+            for k, v in deployment.model_info.model_dump(exclude_none=True).items()
+            if k not in _custom_pricing_fields
+        }
+        litellm.register_model(model_cost={_model_name: _shared_model_info})
 
         # add to model names
         self._add_model_to_list_and_index_map(
